@@ -1,0 +1,745 @@
+#!/usr/bin/env python3
+"""Record everything an Interaxon Muse headband streams over Bluetooth LE
+(EEG electrodes, accelerometer, gyroscope, PPG, battery/telemetry) and
+stream it as CSV on stdout (or to a file), in a format ``live-viewer`` can
+plot live (see README.md).
+
+The script talks to the headband directly over BLE (via ``bleak`` on top of
+BlueZ); no vendor app or SDK is involved.
+
+Output contract
+----------------
+stdout carries ONLY clean CSV (one header row, then one data row per
+sample). All logging/diagnostics go to stderr. Rows from all sensors are
+merged into a single stream whose ``timestamp_ns`` column is globally
+non-decreasing (required by ``live-viewer``). Each row belongs to exactly
+one ``stream`` and fills only that stream's columns; the others are empty.
+Missing samples are left empty -- NEVER interpolated/guessed.
+
+Columns::
+
+    timestamp_ns, timestamp_iso, stream,
+    [seq]                                  (only with --include-seq)
+    TP9, AF7, AF8, TP10, AUX,              (stream "eeg",    uV,    256 Hz)
+    drl, ref,                              (stream "drlref", uV,  ~28.4 Hz)
+    ax, ay, az,                            (stream "acc",    g,    ~51 Hz)
+    gx, gy, gz,                            (stream "gyro",   deg/s, ~51 Hz)
+    ppg_ambient, ppg_ir, ppg_red,          (stream "ppg",    raw,    64 Hz)
+    battery_pct, fuel_gauge_mv, adc_mv, temperature_raw
+                                           (stream "telemetry", ~0.1 Hz)
+    [raw_hex]                              (only with --include-raw-bytes)
+
+``seq`` is the headband's own 16-bit packet counter of the BLE packet the
+sample came from (a jump by more than 1 within a stream = lost packets).
+
+Timestamps
+----------
+``timestamp_ns`` is the estimated *sampling* time of each individual
+sample, in ns since the Unix epoch: every packet carries a sequence number,
+so a sample's position on the headband's own sample clock is known exactly
+(including across lost packets); that clock's rate is measured and it is
+anchored to the host's wall clock (``time.time_ns()`` at BLE packet
+arrival) by tracking the least delayed packets (see SampleClock). Rows are
+held back for ``--reorder-latency`` so they can be emitted in time order
+across sensors. Telemetry rows simply carry their packet's arrival time.
+
+Example usage::
+
+    ./muse-record | live-viewer --width=5s --group=eeg --group=acc ...
+
+See README.md for setup and the full live-viewer invocation.
+"""
+
+import argparse
+import asyncio
+import collections
+import datetime as _dt
+import heapq
+import itertools
+import json
+import os
+import signal
+import sys
+import time
+from typing import Callable, Optional, TextIO
+
+from bleak import BleakClient, BleakScanner
+
+# ---------------------------------------------------------------------------
+# Protocol constants (Muse 2016 / Muse 2 / Muse S, "classic" GATT protocol)
+# ---------------------------------------------------------------------------
+
+MUSE_SERVICE = "0000fe8d-0000-1000-8000-00805f9b34fb"
+
+
+def _uuid(n: int) -> str:
+    return f"273e{n:04x}-4c4d-454d-96be-f03bac821358"
+
+
+CONTROL_UUID = _uuid(0x0001)
+EEG_UUIDS = {  # characteristic -> CSV column
+    _uuid(0x0003): "TP9",
+    _uuid(0x0004): "AF7",
+    _uuid(0x0005): "AF8",
+    _uuid(0x0006): "TP10",
+    _uuid(0x0007): "AUX",
+}
+# Not decoded by other open-source Muse tools; on a Muse 2 it carries
+# pairs of 12-bit values at ~28.4 Hz (256/9), which we read as the DRL and
+# REF electrodes (best-effort interpretation, same uV scaling as EEG).
+DRLREF_UUID = _uuid(0x0008)
+GYRO_UUID = _uuid(0x0009)
+ACC_UUID = _uuid(0x000A)
+TELEMETRY_UUID = _uuid(0x000B)
+PPG_UUIDS = {
+    _uuid(0x000F): "ppg_ambient",
+    _uuid(0x0010): "ppg_ir",
+    _uuid(0x0011): "ppg_red",
+}
+# Muse S Athena (gen 3) uses a different, multiplexed protocol on these.
+ATHENA_UUID = _uuid(0x0013)
+
+EEG_RATE = 256.0
+EEG_SAMPLES_PER_PACKET = 12
+EEG_SCALE_UV = 0.48828125  # 12-bit ADC over a 2 mVpp range, centred at 0x800
+DRLREF_RATE = 256.0 / 9
+DRLREF_SAMPLES_PER_PACKET = 6
+IMU_RATE = 52.0  # nominal; a Muse 2 was measured at 50.81 Hz
+IMU_SAMPLES_PER_PACKET = 3
+ACC_SCALE_G = 0.0000610352
+GYRO_SCALE_DPS = 0.0074768
+PPG_RATE = 64.0
+PPG_SAMPLES_PER_PACKET = 6
+
+EEG_COLUMNS = list(EEG_UUIDS.values())
+DRLREF_COLUMNS = ["drl", "ref"]
+ACC_COLUMNS = ["ax", "ay", "az"]
+GYRO_COLUMNS = ["gx", "gy", "gz"]
+PPG_COLUMNS = list(PPG_UUIDS.values())
+TELEMETRY_COLUMNS = ["battery_pct", "fuel_gauge_mv", "adc_mv", "temperature_raw"]
+VALUE_COLUMNS = EEG_COLUMNS + DRLREF_COLUMNS + ACC_COLUMNS + GYRO_COLUMNS + PPG_COLUMNS + TELEMETRY_COLUMNS
+HEADER = ["timestamp_ns", "timestamp_iso", "stream"]
+
+KEEPALIVE_S = 5.0
+NO_DATA_TIMEOUT_S = 5.0
+
+
+def log(msg: str) -> None:
+    sys.stderr.write(f"[muse-record] {msg}\n")
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# Pure decoders (no BLE involved; covered by tests/)
+# ---------------------------------------------------------------------------
+
+def decode_eeg(data: bytes) -> tuple[int, list[float]]:
+    """20-byte EEG packet: uint16 BE seq + 12 packed unsigned 12-bit samples."""
+    seq = int.from_bytes(data[0:2], "big")
+    out = []
+    b = data[2:20]
+    for i in range(0, 18, 3):
+        out.append((b[i] << 4) | (b[i + 1] >> 4))
+        out.append(((b[i + 1] & 0x0F) << 8) | b[i + 2])
+    return seq, [EEG_SCALE_UV * (v - 0x800) for v in out]
+
+
+def decode_drlref(data: bytes) -> tuple[int, list[tuple[float, float]]]:
+    """20-byte packet on 273e0008: uint16 BE seq + 12 packed 12-bit values,
+    read as 6 (DRL, REF) pairs (best-effort, see DRLREF_UUID)."""
+    seq, vals = decode_eeg(data)
+    return seq, [(vals[2 * i], vals[2 * i + 1]) for i in range(DRLREF_SAMPLES_PER_PACKET)]
+
+
+def decode_imu(data: bytes, scale: float) -> tuple[int, list[tuple[float, float, float]]]:
+    """20-byte IMU packet: uint16 BE seq + 3 samples of (x, y, z) int16 BE."""
+    seq = int.from_bytes(data[0:2], "big")
+    samples = []
+    for k in range(IMU_SAMPLES_PER_PACKET):
+        off = 2 + 6 * k
+        samples.append(tuple(
+            scale * int.from_bytes(data[off + 2 * j: off + 2 * j + 2], "big", signed=True)
+            for j in range(3)
+        ))
+    return seq, samples
+
+
+def decode_ppg(data: bytes) -> tuple[int, list[int]]:
+    """20-byte PPG packet: uint16 BE seq + 6 unsigned 24-bit BE samples."""
+    seq = int.from_bytes(data[0:2], "big")
+    return seq, [int.from_bytes(data[2 + 3 * i: 5 + 3 * i], "big") for i in range(PPG_SAMPLES_PER_PACKET)]
+
+
+def decode_telemetry(data: bytes) -> tuple[int, list[float]]:
+    """Telemetry packet: uint16 BE seq, battery (/512 = %), fuel gauge
+    (*2.2 = mV), ADC voltage (mV), temperature (raw, units undocumented)."""
+    v = [int.from_bytes(data[i:i + 2], "big") for i in range(0, 10, 2)]
+    return v[0], [v[1] / 512.0, v[2] * 2.2, float(v[3]), float(v[4])]
+
+
+def encode_command(cmd: str) -> bytes:
+    """Control command framing: length byte, ASCII command, newline."""
+    return bytes([len(cmd) + 1]) + cmd.encode("ascii") + b"\n"
+
+
+def iso_ns(ts_ns: int) -> str:
+    secs, ns = divmod(ts_ns, 1_000_000_000)
+    dt = _dt.datetime.fromtimestamp(secs, tz=_dt.timezone.utc)
+    return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{ns:09d}Z"
+
+
+def fmt(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if v != v:
+            return "nan"
+        return f"{v:.10g}"
+    return str(v)
+
+
+# ---------------------------------------------------------------------------
+# Sequence unwrapping and sample-clock estimation
+# ---------------------------------------------------------------------------
+
+class SampleClock:
+    """Maps a stream's 16-bit packet counter to per-sample wall-clock times.
+
+    The packet counter is unwrapped into a monotonically increasing packet
+    index; sample ``i`` of packet ``p`` then sits at sample index
+    ``n = p * spp + i`` on the headband's own clock (lost packets therefore
+    leave a correctly sized gap). Time is modelled as
+    ``offset + n * period``:
+
+    * ``period`` starts at the nominal rate and, after ``RATE_AFTER_NS``, is
+      the least-squares slope of arrival time vs. sample index over the
+      whole session (the headband's rates are not exactly nominal; e.g. a
+      Muse 2's "52 Hz" IMU was measured at 50.8 Hz).
+    * ``offset`` targets the least-delayed packet within a sliding window
+      (minimum of ``arrival - n_last * period``), which also absorbs slow
+      drift. After a short warm-up the offset actually used only moves
+      towards that target at a limited slew rate, so timestamps within a
+      stream never go backwards and never jump.
+    """
+
+    RESYNC_GAP_PACKETS = 2000   # a jump this large (or backwards): restart
+    WINDOW_NS = 10_000_000_000  # sliding window for the minimum-delay filter
+    WARMUP_NS = 2_000_000_000   # follow the target directly at first
+    RATE_AFTER_NS = 5_000_000_000
+    MAX_SLEW = 0.005            # afterwards: at most 5 ms change per second
+
+    def __init__(self, rate_hz: float, samples_per_packet: int):
+        self.nominal_period_ns = 1e9 / rate_hz
+        self.spp = samples_per_packet
+        self.lost_packets = 0
+        self.last_seq: Optional[int] = None
+        self._reset()
+
+    def _reset(self) -> None:
+        self.packet_index = 0
+        self.period_ns = self.nominal_period_ns
+        self.offset_ns: Optional[float] = None
+        self.window: collections.deque = collections.deque()  # (arrival_ns, last sample index)
+        self.start_ns = 0
+        self.last_arrival = 0
+        # online least squares of (sample index, arrival - start) [Welford]
+        self.k = 0
+        self.mean_x = self.mean_y = self.cxx = self.cxy = 0.0
+
+    @property
+    def rate_measured(self) -> bool:
+        return self.period_ns != self.nominal_period_ns
+
+    @property
+    def rate_hz(self) -> float:
+        return 1e9 / self.period_ns
+
+    def packet(self, seq: int, arrival_ns: int) -> list[int]:
+        """Register one packet; return the timestamps of its samples."""
+        if self.last_seq is not None:
+            step = (seq - self.last_seq) & 0xFFFF
+            if step == 0 or step > self.RESYNC_GAP_PACKETS:
+                self._reset()  # duplicate/backwards/huge jump: fresh start
+            else:
+                if step > 1:
+                    self.lost_packets += step - 1
+                self.packet_index += step
+        self.last_seq = seq
+        first = self.packet_index * self.spp
+        last = first + self.spp - 1
+        if self.offset_ns is None:
+            self.start_ns = arrival_ns
+        elapsed = arrival_ns - self.start_ns
+
+        # rate estimate
+        self.k += 1
+        dx = last - self.mean_x
+        self.mean_x += dx / self.k
+        dy = elapsed - self.mean_y
+        self.mean_y += dy / self.k
+        self.cxx += dx * (last - self.mean_x)
+        self.cxy += dx * (elapsed - self.mean_y)
+        if elapsed > self.RATE_AFTER_NS and self.cxx > 0:
+            slope = self.cxy / self.cxx
+            if abs(slope / self.nominal_period_ns - 1) < 0.1:  # sanity
+                if self.offset_ns is not None:
+                    # keep the timeline continuous at the current sample
+                    self.offset_ns += last * (self.period_ns - slope)
+                self.period_ns = slope
+
+        # offset: minimum-delay filter over a sliding window
+        self.window.append((arrival_ns, last))
+        while self.window[0][0] < arrival_ns - self.WINDOW_NS:
+            self.window.popleft()
+        target = min(t - n * self.period_ns for t, n in self.window)
+        if self.offset_ns is None or elapsed < self.WARMUP_NS:
+            self.offset_ns = target
+        else:
+            max_step = self.MAX_SLEW * (arrival_ns - self.last_arrival)
+            self.offset_ns += max(-max_step, min(max_step, target - self.offset_ns))
+        self.last_arrival = arrival_ns
+        return [int(self.offset_ns + (first + i) * self.period_ns) for i in range(self.spp)]
+
+
+class MultiCharAssembler:
+    """Joins packets from several characteristics that share one sequence
+    counter (the EEG electrodes; the PPG channels) into one block per seq.
+
+    A block is released once every channel seen so far has delivered it, or
+    once it is ``MAX_PENDING`` seqs behind the newest one (then the missing
+    channels of that block stay empty). During the first ``WARMUP`` seqs the
+    set of channels is still being learned, so blocks are released by age
+    only. A packet for an already released seq is dropped (``late``).
+    """
+
+    MAX_PENDING = 2
+    WARMUP = 3
+
+    def __init__(self, on_block: Callable[[int, int, dict], None]):
+        self.on_block = on_block
+        self.known: set[str] = set()
+        self.pending: dict[int, tuple[int, dict]] = {}  # seq -> (arrival_ns, {col: samples})
+        self.order: list[int] = []
+        self.released: collections.deque = collections.deque(maxlen=64)
+        self.seen_seqs = 0
+        self.late = 0
+
+    def _release_oldest(self) -> int:
+        s = self.order.pop(0)
+        t, c = self.pending.pop(s)
+        self.released.append(s)
+        self.on_block(s, t, c)
+        return s
+
+    def add(self, col: str, seq: int, arrival_ns: int, samples: list) -> None:
+        self.known.add(col)
+        if seq not in self.pending:
+            if seq in self.released:
+                self.late += 1
+                return
+            self.pending[seq] = (arrival_ns, {})
+            self.order.append(seq)
+            self.seen_seqs += 1
+        t0, chans = self.pending[seq]
+        chans[col] = samples
+        # all channels of a block are sampled together; the earliest arrival
+        # is the best (least delayed) estimate of when the block was ready
+        self.pending[seq] = (min(t0, arrival_ns), chans)
+        if self.seen_seqs > self.WARMUP and len(chans) >= len(self.known):
+            # release everything up to and including this seq, in order
+            while self.order and self._release_oldest() != seq:
+                pass
+        while len(self.order) > self.MAX_PENDING:
+            self._release_oldest()
+
+    def flush(self) -> None:
+        while self.order:
+            self._release_oldest()
+
+
+# ---------------------------------------------------------------------------
+# Output: time-ordered CSV writer
+# ---------------------------------------------------------------------------
+
+class OrderedCSVWriter:
+    """Holds rows for ``latency_ns`` and emits them sorted by timestamp, so
+    that the merged multi-sensor output is globally non-decreasing in time.
+    A row that still arrives too late is clamped to the last emitted
+    timestamp (counted in ``clamped``) rather than emitted out of order."""
+
+    def __init__(self, fh: TextIO, latency_ns: int, include_raw: bool, include_seq: bool):
+        self.fh = fh
+        self.latency_ns = latency_ns
+        self.include_raw = include_raw
+        self.include_seq = include_seq
+        self.heap: list = []
+        self.counter = itertools.count()
+        self.last_ts = 0
+        self.rows = 0
+        self.clamped = 0
+        self.per_stream: dict[str, int] = {}
+        header = HEADER + (["seq"] if include_seq else []) + VALUE_COLUMNS
+        header += ["raw_hex"] if include_raw else []
+        fh.write(",".join(header) + "\n")
+        fh.flush()
+
+    def add(self, ts_ns: int, stream: str, seq: int, values: dict, raw: Optional[bytes] = None) -> None:
+        heapq.heappush(self.heap, (ts_ns, next(self.counter), stream, seq, values, raw))
+
+    def flush(self, everything: bool = False) -> None:
+        horizon = time.time_ns() - self.latency_ns
+        out = []
+        while self.heap and (everything or self.heap[0][0] <= horizon):
+            ts, _, stream, seq, values, raw = heapq.heappop(self.heap)
+            if ts < self.last_ts:
+                ts = self.last_ts
+                self.clamped += 1
+            self.last_ts = ts
+            fields = [str(ts), iso_ns(ts), stream]
+            if self.include_seq:
+                fields.append(str(seq))
+            fields += [fmt(values.get(c)) for c in VALUE_COLUMNS]
+            if self.include_raw:
+                fields.append(raw.hex() if isinstance(raw, bytes) else (raw or ""))
+            out.append(",".join(fields))
+            self.per_stream[stream] = self.per_stream.get(stream, 0) + 1
+        if out:
+            self.fh.write("\n".join(out) + "\n")
+            self.fh.flush()
+            self.rows += len(out)
+
+
+# ---------------------------------------------------------------------------
+# Recorder: BLE callbacks -> decoded rows
+# ---------------------------------------------------------------------------
+
+class Recorder:
+    def __init__(self, writer: OrderedCSVWriter, verbose: bool = False):
+        self.w = writer
+        self.verbose = verbose
+        self.eeg_clock = SampleClock(EEG_RATE, EEG_SAMPLES_PER_PACKET)
+        self.acc_clock = SampleClock(IMU_RATE, IMU_SAMPLES_PER_PACKET)
+        self.gyro_clock = SampleClock(IMU_RATE, IMU_SAMPLES_PER_PACKET)
+        self.ppg_clock = SampleClock(PPG_RATE, PPG_SAMPLES_PER_PACKET)
+        self.drlref_clock = SampleClock(DRLREF_RATE, DRLREF_SAMPLES_PER_PACKET)
+        self.eeg = MultiCharAssembler(self._eeg_block)
+        self.ppg = MultiCharAssembler(self._ppg_block)
+        self.control_buf = ""
+        self.control_messages: list[dict] = []
+        self.last_data_ns = time.time_ns()
+        self.raw_by_seq: dict = {}
+
+    # --- dispatch ---
+
+    def handler(self, uuid: str) -> Callable:
+        def cb(_sender, data: bytearray, uuid=uuid):
+            ts = time.time_ns()  # capture arrival as early as possible
+            try:
+                self.on_packet(uuid, ts, bytes(data))
+            except Exception as e:  # never let one bad packet kill recording
+                log(f"error decoding packet on {uuid[4:8]}: {e!r} ({bytes(data).hex()})")
+        return cb
+
+    def on_packet(self, uuid: str, ts: int, data: bytes) -> None:
+        if uuid == CONTROL_UUID:
+            self._control(data)
+            return
+        self.last_data_ns = ts
+        if uuid in EEG_UUIDS:
+            seq, samples = decode_eeg(data)
+            self._keep_raw("eeg", EEG_UUIDS[uuid], seq, data)
+            self.eeg.add(EEG_UUIDS[uuid], seq, ts, samples)
+        elif uuid in PPG_UUIDS:
+            seq, samples = decode_ppg(data)
+            self._keep_raw("ppg", PPG_UUIDS[uuid], seq, data)
+            self.ppg.add(PPG_UUIDS[uuid], seq, ts, samples)
+        elif uuid == DRLREF_UUID:
+            seq, samples = decode_drlref(data)
+            for i, (t, s) in enumerate(zip(self.drlref_clock.packet(seq, ts), samples)):
+                self.w.add(t, "drlref", seq, dict(zip(DRLREF_COLUMNS, s)), data if i == 0 else None)
+        elif uuid in (ACC_UUID, GYRO_UUID):
+            is_acc = uuid == ACC_UUID
+            seq, samples = decode_imu(data, ACC_SCALE_G if is_acc else GYRO_SCALE_DPS)
+            clock = self.acc_clock if is_acc else self.gyro_clock
+            cols = ACC_COLUMNS if is_acc else GYRO_COLUMNS
+            for i, (t, s) in enumerate(zip(clock.packet(seq, ts), samples)):
+                self.w.add(t, "acc" if is_acc else "gyro", seq, dict(zip(cols, s)),
+                           data if i == 0 else None)
+        elif uuid == TELEMETRY_UUID:
+            seq, vals = decode_telemetry(data)
+            self.w.add(ts, "telemetry", seq, dict(zip(TELEMETRY_COLUMNS, vals)), data)
+            if self.verbose:
+                log(f"telemetry: battery {vals[0]:.1f}%, fuel gauge {vals[1]:.0f} mV")
+        else:
+            # characteristic we have no decoder for (only subscribed with
+            # --include-raw-bytes): keep its bytes verbatim
+            seq = int.from_bytes(data[0:2], "big") if len(data) >= 2 else 0
+            self.w.add(ts, "c" + uuid[4:8], seq, {}, data)
+
+    def _keep_raw(self, stream: str, col: str, seq: int, data: bytes) -> None:
+        if self.w.include_raw:
+            self.raw_by_seq.setdefault((stream, seq), {})[col] = data
+
+    def _raw_for(self, stream: str, seq: int, cols: list) -> Optional[str]:
+        """Packets of one block in column order, ':'-separated ('' = missing)."""
+        parts = self.raw_by_seq.pop((stream, seq), None)
+        if not parts:
+            return None
+        return ":".join(parts[c].hex() if c in parts else "" for c in cols)
+
+    # --- multi-characteristic blocks ---
+
+    def _eeg_block(self, seq: int, arrival: int, chans: dict) -> None:
+        raw = self._raw_for("eeg", seq, EEG_COLUMNS)
+        for i, t in enumerate(self.eeg_clock.packet(seq, arrival)):
+            self.w.add(t, "eeg", seq, {c: s[i] for c, s in chans.items()}, raw if i == 0 else None)
+
+    def _ppg_block(self, seq: int, arrival: int, chans: dict) -> None:
+        raw = self._raw_for("ppg", seq, PPG_COLUMNS)
+        for i, t in enumerate(self.ppg_clock.packet(seq, arrival)):
+            self.w.add(t, "ppg", seq, {c: s[i] for c, s in chans.items()}, raw if i == 0 else None)
+
+    # --- control channel (JSON replies, fragmented) ---
+
+    def _control(self, data: bytes) -> None:
+        n = data[0] if data else 0
+        self.control_buf += data[1:1 + n].decode("ascii", errors="replace")
+        while "}" in self.control_buf:
+            msg, _, self.control_buf = self.control_buf.partition("}")
+            msg += "}"
+            start = msg.find("{")
+            if start < 0:
+                continue
+            try:
+                parsed = json.loads(msg[start:])
+            except json.JSONDecodeError:
+                parsed = {"unparsed": msg[start:]}
+            self.control_messages.append(parsed)
+            if self.verbose or set(parsed) != {"rc"}:  # bare acks are noise
+                log(f"device: {json.dumps(parsed)}")
+
+    def flush_all(self) -> None:
+        self.eeg.flush()
+        self.ppg.flush()
+        self.w.flush(everything=True)
+
+    def lost_summary(self) -> str:
+        parts = []
+        for name, c in (("eeg", self.eeg_clock), ("drlref", self.drlref_clock), ("acc", self.acc_clock),
+                        ("gyro", self.gyro_clock), ("ppg", self.ppg_clock)):
+            if c.last_seq is not None:
+                rate = f" (measured rate {c.rate_hz:.2f} Hz)" if c.rate_measured else ""
+                parts.append(f"{name} {c.lost_packets}{rate}")
+        late = self.eeg.late + self.ppg.late
+        if late:
+            parts.append(f"late channel packets dropped {late}")
+        return ", ".join(parts) or "n/a"
+
+
+# ---------------------------------------------------------------------------
+# BLE session
+# ---------------------------------------------------------------------------
+
+def is_muse(device, adv) -> bool:
+    name = device.name or (adv.local_name if adv else None) or ""
+    uuids = [u.lower() for u in (adv.service_uuids if adv else [])]
+    return name.lower().startswith("muse") or MUSE_SERVICE in uuids
+
+
+async def find_muses(timeout: float) -> list:
+    found = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    return [(d, a) for d, a in found.values() if is_muse(d, a)]
+
+
+async def resolve_device(address: Optional[str], timeout: float):
+    if address:
+        dev = await BleakScanner.find_device_by_address(address, timeout=timeout)
+        if dev is None:
+            raise SystemExit(
+                f"[muse-record] {address} not found -- is the headband on (LED "
+                "blinking) and not connected to a phone/another program?")
+        return dev
+    log(f"scanning up to {timeout:.0f}s for a Muse headband ...")
+    dev = await BleakScanner.find_device_by_filter(is_muse, timeout=timeout)
+    if dev is None:
+        raise SystemExit(
+            "[muse-record] no Muse headband found -- turn it on (LED blinking), "
+            "make sure no phone/app is connected to it, and retry (see README)")
+    return dev
+
+
+async def send(client: BleakClient, cmd: str) -> None:
+    await client.write_gatt_char(CONTROL_UUID, encode_command(cmd), response=False)
+
+
+async def run(args) -> int:
+    if args.scan:
+        for d, a in await find_muses(args.scan_timeout):
+            print(f"{d.address}\t{d.name or a.local_name}\t{a.rssi} dBm")
+        return 0
+
+    device = await resolve_device(args.address, args.scan_timeout)
+    log(f"connecting to {device.name} ({device.address}) ...")
+
+    out: TextIO
+    if args.output in (None, "-"):
+        out = sys.stdout
+    else:
+        out = open(args.output, "w", buffering=1 << 16, newline="")
+    writer = OrderedCSVWriter(out, int(args.reorder_latency * 1e9), args.include_raw_bytes,
+                              args.include_seq or args.include_raw_bytes)
+    rec = Recorder(writer, verbose=args.verbose)
+
+    disconnected = asyncio.Event()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(s, stop.set)
+
+    client = BleakClient(device, disconnected_callback=lambda _c: disconnected.set())
+    for attempt in range(1, 4):
+        try:
+            await client.connect(timeout=20.0)
+            break
+        except Exception as e:
+            log(f"connect attempt {attempt} failed: {e!r}")
+            if attempt == 3:
+                raise SystemExit("[muse-record] could not connect (see README, 'Connecting')")
+            await asyncio.sleep(2)
+
+    exit_code = 0
+    try:
+        chars = {c.uuid.lower(): c for s in client.services for c in s.characteristics}
+        if ATHENA_UUID in chars and _uuid(0x0003) not in chars:
+            raise SystemExit(
+                "[muse-record] this is a Muse S Athena (gen 3) headband, which "
+                "uses a different BLE protocol that muse-record does not decode yet")
+        has_ppg = all(u in chars for u in PPG_UUIDS)
+        preset = args.preset or ("p50" if has_ppg else "p20")
+
+        wanted = [CONTROL_UUID]
+        if not args.skip_eeg:
+            wanted += list(EEG_UUIDS)
+        if not args.skip_acc:
+            wanted.append(ACC_UUID)
+        if not args.skip_gyro:
+            wanted.append(GYRO_UUID)
+        if not args.skip_telemetry:
+            wanted.append(TELEMETRY_UUID)
+        if not args.skip_drlref:
+            wanted.append(DRLREF_UUID)
+        if not args.skip_ppg and has_ppg:
+            wanted += list(PPG_UUIDS)
+        if args.include_raw_bytes:
+            known = {CONTROL_UUID, DRLREF_UUID, ACC_UUID, GYRO_UUID, TELEMETRY_UUID, *EEG_UUIDS, *PPG_UUIDS}
+            wanted += [u for u, c in chars.items()
+                       if u.startswith("273e") and u not in known and "notify" in c.properties]
+        missing = [u for u in wanted if u not in chars]
+        for u in missing:
+            log(f"note: characteristic {u[4:8]} not present on this headband, skipping")
+        wanted = [u for u in wanted if u in chars]
+
+        await send(client, "h")  # halt any previous streaming
+        await asyncio.sleep(0.1)
+        for u in wanted:
+            await client.start_notify(u, rec.handler(u))
+        if args.verbose:
+            log("subscribed to: " + ", ".join(u[4:8] for u in wanted))
+        await send(client, "v1")  # device/firmware info (logged to stderr)
+        await asyncio.sleep(0.3)
+        log(f"selecting preset {preset}")
+        await send(client, preset)
+        await asyncio.sleep(0.1)
+        await send(client, "s")  # status: serial, battery, preset (stderr)
+        await asyncio.sleep(0.3)
+        await send(client, "d")  # start streaming
+        log("recording; Ctrl+C to stop")
+
+        if args.info:
+            await asyncio.sleep(2.0)
+            stop.set()
+
+        t_start = time.monotonic()
+        next_keepalive = t_start + KEEPALIVE_S
+        rec.last_data_ns = time.time_ns()
+        while not stop.is_set() and not disconnected.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass
+            writer.flush()
+            now = time.monotonic()
+            if args.duration and now - t_start >= args.duration:
+                break
+            if now >= next_keepalive:
+                next_keepalive = now + KEEPALIVE_S
+                try:
+                    await send(client, "k")
+                except Exception as e:
+                    log(f"keep-alive failed: {e!r}")
+            if time.time_ns() - rec.last_data_ns > NO_DATA_TIMEOUT_S * 1e9:
+                log(f"no data for {NO_DATA_TIMEOUT_S:.0f}s, re-sending start command")
+                rec.last_data_ns = time.time_ns()
+                await send(client, "d")
+        if disconnected.is_set():
+            log("headband disconnected")
+            exit_code = 1
+    except BrokenPipeError:
+        # the consumer (e.g. live-viewer) went away; silence further writes
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    finally:
+        try:
+            if client.is_connected:
+                await send(client, "h")
+                await client.disconnect()
+        except Exception:
+            pass
+        try:
+            rec.flush_all()
+            if out is not sys.stdout:
+                out.close()
+        except BrokenPipeError:
+            pass
+        summary = ", ".join(f"{k} {v}" for k, v in sorted(writer.per_stream.items()))
+        log(f"stopped; rows written: {writer.rows} ({summary or 'none'}); "
+            f"lost packets: {rec.lost_summary()}"
+            + (f"; {writer.clamped} late rows clamped" if writer.clamped else ""))
+    return exit_code
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--address", help="BLE address of the headband (default: the first Muse found)")
+    p.add_argument("--scan", action="store_true", help="list nearby Muse headbands and exit")
+    p.add_argument("--scan-timeout", type=float, default=10.0, help="seconds to scan (default 10)")
+    p.add_argument("--info", action="store_true",
+                   help="connect, print device info/status to stderr, record ~2s, exit")
+    p.add_argument("-o", "--output", default="-", help="output CSV file (default: stdout)")
+    p.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
+    p.add_argument("--preset", default=None,
+                   help="headband preset command, e.g. p20 (4 EEG + AUX), p21 (4 EEG), "
+                        "p50 (EEG + PPG); default: p50 if the headband has PPG, else p20")
+    p.add_argument("--skip-eeg", action="store_true", help="do not record EEG")
+    p.add_argument("--skip-acc", action="store_true", help="do not record the accelerometer")
+    p.add_argument("--skip-gyro", action="store_true", help="do not record the gyroscope")
+    p.add_argument("--skip-ppg", action="store_true", help="do not record PPG")
+    p.add_argument("--skip-drlref", action="store_true", help="do not record the DRL/REF electrodes")
+    p.add_argument("--skip-telemetry", action="store_true", help="do not record battery/telemetry")
+    p.add_argument("--include-seq", action="store_true",
+                   help="add a seq column: the headband's 16-bit packet counter of each row")
+    p.add_argument("--include-raw-bytes", action="store_true",
+                   help="add a raw_hex column with the verbatim BLE packet(s) of each row "
+                        "(first row of each packet; implies --include-seq), and also record "
+                        "any other notifying Muse characteristic without a decoder")
+    p.add_argument("--reorder-latency", type=float, default=0.5,
+                   help="seconds rows are held back to be emitted in time order (default 0.5)")
+    p.add_argument("--verbose", "-v", action="store_true", help="extra diagnostics on stderr")
+    args = p.parse_args()
+    try:
+        sys.exit(asyncio.run(run(args)))
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
