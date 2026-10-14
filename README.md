@@ -134,10 +134,13 @@ per stream, packets lost in transmission, and the measured sampling rates.
 | flag | default | meaning |
 |---|---|---|
 | `--address ADDR` | first Muse found | BLE address of the headband |
+| `--name NAME` | first Muse found | Bluetooth name of the headband, e.g. `Muse-861D` |
 | `--scan` | | list nearby Muse headbands and exit |
 | `--scan-timeout S` | `10` | seconds to scan |
 | `--info` | | print device info/status to stderr, record ~2 s, exit |
 | `-o`, `--output FILE` | `-` (stdout) | output CSV file |
+| `--lsl` | off | publish to a Lab Streaming Layer outlet instead of CSV (needs `pylsl`, see below) |
+| `--lsl-name S` | `Muse` | LSL stream name; give each headband its own |
 | `--duration S` | unlimited | stop after this many seconds |
 | `--preset P` | `p50` if the headband has PPG, else `p20` | headband preset (see below) |
 | `--skip-eeg`, `--skip-drlref`, `--skip-acc`, `--skip-gyro`, `--skip-ppg`, `--skip-telemetry` | | do not record that stream |
@@ -205,6 +208,16 @@ ppg_ambient, ppg_ir, ppg_red, battery_pct, fuel_gauge_mv, adc_mv, temperature_ra
   Muse 2.
 - The accelerometer/gyroscope rate is usually quoted as 52 Hz, but the tested
   Muse 2 sends 50.8 Hz. The timestamps use the measured rate.
+
+## Lab Streaming Layer
+
+With `--lsl` (`pip install pylsl` first) the rows go to one LSL outlet instead of CSV, in the same
+way `epoc-direct-record --lsl` publishes an EPOC X: one float32 sample per CSV row; the channels are
+the CSV columns without the two timestamps (the sample's LSL timestamp carries the sampling time in
+unix seconds) and with `stream` as a number, the index into the comma-separated list in the stream's
+`desc/stream_codes` (`eeg,drlref,acc,gyro,ppg,telemetry`); empty cells are NaN. The desc also has
+`manufacturer`, `device_name`, `device_address` and the label/type/unit of each channel. The stream
+has no nominal rate, as rows of all sensors are interleaved.
 
 ## Testing
 

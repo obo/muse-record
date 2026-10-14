@@ -43,9 +43,22 @@ arrival) by tracking the least delayed packets (see SampleClock). Rows are
 held back for ``--reorder-latency`` so they can be emitted in time order
 across sensors. Telemetry rows simply carry their packet's arrival time.
 
+Lab Streaming Layer
+-------------------
+With ``--lsl`` the rows go to one LSL outlet (``--lsl-name``, default
+``Muse``) instead of CSV, the same way ``epoc-direct-record --lsl`` publishes
+an EPOC X: one float32 sample per CSV row, the channels being the CSV columns
+without the two timestamps (carried by the sample's LSL timestamp, in unix
+seconds) and with ``stream`` as a number (index into the desc's
+``stream_codes``, e.g. 0 = eeg); empty cells are NaN. The desc also holds
+``manufacturer``, ``device_name``, ``device_address`` and per-channel
+label/type/unit. ``epoc-direct-record/save-lsl.py`` saves such a stream back
+to muse-record's CSV.
+
 Example usage::
 
     ./muse-record | live-viewer --width=5s --group=eeg --group=acc ...
+    ./muse-record --lsl --lsl-name 'Muse'
 
 See README.md for setup and the full live-viewer invocation.
 """
@@ -119,6 +132,10 @@ PPG_COLUMNS = list(PPG_UUIDS.values())
 TELEMETRY_COLUMNS = ["battery_pct", "fuel_gauge_mv", "adc_mv", "temperature_raw"]
 VALUE_COLUMNS = EEG_COLUMNS + DRLREF_COLUMNS + ACC_COLUMNS + GYRO_COLUMNS + PPG_COLUMNS + TELEMETRY_COLUMNS
 HEADER = ["timestamp_ns", "timestamp_iso", "stream"]
+STREAM_CODES = ["eeg", "drlref", "acc", "gyro", "ppg", "telemetry"]  # LSL 'stream' channel value = index
+LSL_STREAM_NAME = "Muse"
+LSL_STREAM_TYPE = "EEG"
+_NAN = float("nan")
 
 KEEPALIVE_S = 5.0
 NO_DATA_TIMEOUT_S = 5.0
@@ -367,8 +384,10 @@ class OrderedCSVWriter:
     A row that still arrives too late is clamped to the last emitted
     timestamp (counted in ``clamped``) rather than emitted out of order."""
 
-    def __init__(self, fh: TextIO, latency_ns: int, include_raw: bool, include_seq: bool):
+    def __init__(self, fh: Optional[TextIO], latency_ns: int, include_raw: bool, include_seq: bool,
+                 outlet=None):
         self.fh = fh
+        self.outlet = outlet  # pylsl StreamOutlet (--lsl): rows are pushed there instead of fh
         self.latency_ns = latency_ns
         self.include_raw = include_raw
         self.include_seq = include_seq
@@ -380,8 +399,9 @@ class OrderedCSVWriter:
         self.per_stream: dict[str, int] = {}
         header = HEADER + (["seq"] if include_seq else []) + VALUE_COLUMNS
         header += ["raw_hex"] if include_raw else []
-        fh.write(",".join(header) + "\n")
-        fh.flush()
+        if fh is not None:
+            fh.write(",".join(header) + "\n")
+            fh.flush()
 
     def add(self, ts_ns: int, stream: str, seq: int, values: dict, raw: Optional[bytes] = None) -> None:
         heapq.heappush(self.heap, (ts_ns, next(self.counter), stream, seq, values, raw))
@@ -395,6 +415,10 @@ class OrderedCSVWriter:
                 ts = self.last_ts
                 self.clamped += 1
             self.last_ts = ts
+            self.per_stream[stream] = self.per_stream.get(stream, 0) + 1
+            if self.outlet is not None:
+                self._push_lsl(ts, stream, seq, values)
+                continue
             fields = [str(ts), iso_ns(ts), stream]
             if self.include_seq:
                 fields.append(str(seq))
@@ -402,11 +426,56 @@ class OrderedCSVWriter:
             if self.include_raw:
                 fields.append(raw.hex() if isinstance(raw, bytes) else (raw or ""))
             out.append(",".join(fields))
-            self.per_stream[stream] = self.per_stream.get(stream, 0) + 1
         if out:
             self.fh.write("\n".join(out) + "\n")
             self.fh.flush()
             self.rows += len(out)
+
+
+    def _push_lsl(self, ts: int, stream: str, seq: int, values: dict) -> None:
+        if stream not in STREAM_CODES:
+            return  # undecoded characteristic (--include-raw-bytes): no numeric channels
+        sample = [float(STREAM_CODES.index(stream))]
+        if self.include_seq:
+            sample.append(float(seq))
+        for c in VALUE_COLUMNS:
+            v = values.get(c)
+            sample.append(_NAN if v is None else float(v))
+        self.outlet.push_sample(sample, ts / 1e9)  # unix seconds, as epoc-direct-record --lsl
+        self.rows += 1
+
+
+def make_outlet(name: str, device, include_seq: bool):
+    """The --lsl outlet: channels = the CSV columns minus the timestamps (see the module doc)."""
+    try:
+        from pylsl import IRREGULAR_RATE, StreamInfo, StreamOutlet
+    except ImportError as e:
+        raise SystemExit(f"[muse-record] --lsl needs pylsl (pip install pylsl): {e}")
+    labels = ["stream"] + (["seq"] if include_seq else []) + VALUE_COLUMNS
+    types = {**{c: ("EEG", "microvolts") for c in EEG_COLUMNS + DRLREF_COLUMNS},
+             **{c: ("ACC", "g") for c in ACC_COLUMNS},
+             **{c: ("GYRO", "degrees/s") for c in GYRO_COLUMNS},
+             **{c: ("PPG", "counts") for c in PPG_COLUMNS}}
+    # rows of all sensors are interleaved, so the stream has no regular rate
+    info = StreamInfo(name, LSL_STREAM_TYPE, len(labels), IRREGULAR_RATE, "float32",
+                      f"muse-{device.address}")
+    desc = info.desc()
+    desc.append_child_value("manufacturer", "Interaxon")
+    desc.append_child_value("device_name", device.name or "")
+    desc.append_child_value("device_address", device.address or "")
+    desc.append_child_value("stream_codes", ",".join(STREAM_CODES))
+    chns = desc.append_child("channels")
+    for label in labels:
+        typ, unit = types.get(label, ("misc", ""))
+        ch = chns.append_child("channel")
+        ch.append_child_value("label", label)
+        ch.append_child_value("type", typ)
+        if unit:
+            ch.append_child_value("unit", unit)
+    outlet = StreamOutlet(info)
+    log(f"LSL outlet '{name}' ({LSL_STREAM_TYPE}, {len(labels)} ch, irregular rate) open; "
+        f"source_id=muse-{device.address}")
+    return outlet
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +620,17 @@ async def find_muses(timeout: float) -> list:
     return [(d, a) for d, a in found.values() if is_muse(d, a)]
 
 
-async def resolve_device(address: Optional[str], timeout: float):
+async def resolve_device(address: Optional[str], timeout: float, name: Optional[str] = None):
+    if name:
+        log(f"scanning up to {timeout:.0f}s for '{name}' ...")
+        dev = await BleakScanner.find_device_by_filter(
+            lambda d, a: is_muse(d, a) and name in (d.name, a.local_name if a else None)
+            and (not address or d.address == address), timeout=timeout)
+        if dev is None:
+            raise SystemExit(
+                f"[muse-record] '{name}' not found -- is the headband on (LED "
+                "blinking) and not connected to a phone/another program?")
+        return dev
     if address:
         dev = await BleakScanner.find_device_by_address(address, timeout=timeout)
         if dev is None:
@@ -578,16 +657,20 @@ async def run(args) -> int:
             print(f"{d.address}\t{d.name or a.local_name}\t{a.rssi} dBm")
         return 0
 
-    device = await resolve_device(args.address, args.scan_timeout)
+    device = await resolve_device(args.address, args.scan_timeout, args.name)
     log(f"connecting to {device.name} ({device.address}) ...")
 
-    out: TextIO
-    if args.output in (None, "-"):
+    out: Optional[TextIO]
+    outlet = None
+    if args.lsl:
+        out = None
+        outlet = make_outlet(args.lsl_name, device, args.include_seq or args.include_raw_bytes)
+    elif args.output in (None, "-"):
         out = sys.stdout
     else:
         out = open(args.output, "w", buffering=1 << 16, newline="")
     writer = OrderedCSVWriter(out, int(args.reorder_latency * 1e9), args.include_raw_bytes,
-                              args.include_seq or args.include_raw_bytes)
+                              args.include_seq or args.include_raw_bytes, outlet)
     rec = Recorder(writer, verbose=args.verbose)
 
     disconnected = asyncio.Event()
@@ -696,7 +779,7 @@ async def run(args) -> int:
             pass
         try:
             rec.flush_all()
-            if out is not sys.stdout:
+            if out is not None and out is not sys.stdout:
                 out.close()
         except BrokenPipeError:
             pass
@@ -710,11 +793,16 @@ async def run(args) -> int:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--address", help="BLE address of the headband (default: the first Muse found)")
+    p.add_argument("--name", help="Bluetooth name of the headband, e.g. Muse-861D (default: the first Muse found)")
     p.add_argument("--scan", action="store_true", help="list nearby Muse headbands and exit")
     p.add_argument("--scan-timeout", type=float, default=10.0, help="seconds to scan (default 10)")
     p.add_argument("--info", action="store_true",
                    help="connect, print device info/status to stderr, record ~2s, exit")
     p.add_argument("-o", "--output", default="-", help="output CSV file (default: stdout)")
+    p.add_argument("--lsl", action="store_true",
+                   help="publish to a Lab Streaming Layer outlet instead of writing CSV (needs pylsl)")
+    p.add_argument("--lsl-name", default=LSL_STREAM_NAME,
+                   help=f"LSL stream name (default {LSL_STREAM_NAME}); give each headband its own")
     p.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     p.add_argument("--preset", default=None,
                    help="headband preset command, e.g. p20 (4 EEG + AUX), p21 (4 EEG), "
